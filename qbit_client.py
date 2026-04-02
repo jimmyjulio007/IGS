@@ -1,5 +1,6 @@
-"""qBittorrent WebAPI client wrapper."""
+"""qBittorrent WebAPI client wrapper — Beast Edition."""
 
+import json
 import requests
 
 
@@ -34,7 +35,7 @@ class QBitClient:
 
     # ── Torrent Info ──────────────────────────────────────────────
 
-    def get_torrents(self, filter_status=None, category=None, sort=None):
+    def get_torrents(self, filter_status=None, category=None, sort=None, tag=None):
         """List all torrents, optionally filtered."""
         params = {}
         if filter_status:
@@ -43,6 +44,8 @@ class QBitClient:
             params["category"] = category
         if sort:
             params["sort"] = sort
+        if tag:
+            params["tag"] = tag
         return self._get("torrents/info", **params)
 
     def get_torrent(self, torrent_hash):
@@ -57,6 +60,10 @@ class QBitClient:
     def get_torrent_files(self, torrent_hash):
         """Get contents (files) of a specific torrent."""
         return self._get("torrents/files", hash=torrent_hash)
+
+    def get_torrent_properties(self, torrent_hash):
+        """Get detailed properties for a torrent (creation date, piece size, etc)."""
+        return self._get("torrents/properties", hash=torrent_hash)
 
     # ── Transfer & Speed Limits ───────────────────────────────────
 
@@ -73,6 +80,14 @@ class QBitClient:
         info = self.get_global_transfer_info()
         return info.get("use_alt_speed_limits", 0)
 
+    def set_global_upload_limit(self, limit_bytes):
+        """Set global upload speed limit. 0 = unlimited."""
+        self._post("transfer/setUploadLimit", limit=limit_bytes)
+
+    def set_global_download_limit(self, limit_bytes):
+        """Set global download speed limit. 0 = unlimited."""
+        self._post("transfer/setDownloadLimit", limit=limit_bytes)
+
     # ── Torrent Actions ───────────────────────────────────────────
 
     def add_torrent(self, urls=None, torrent_file=None, category=None, paused=False):
@@ -86,9 +101,12 @@ class QBitClient:
             data["category"] = category
 
         if torrent_file:
+            import os
+            filename = os.path.basename(torrent_file)
             with open(torrent_file, "rb") as f:
-                files = {"torrents": f}
-                resp = self.session.post(f"{self.base_url}/torrents/add", data=data, files=files)
+                content = f.read()
+            files = {"torrents": (filename, content, "application/x-bittorrent")}
+            resp = self.session.post(f"{self.base_url}/torrents/add", data=data, files=files)
         else:
             resp = self.session.post(f"{self.base_url}/torrents/add", data=data)
 
@@ -121,6 +139,11 @@ class QBitClient:
         tag_str = tags if isinstance(tags, str) else ",".join(tags)
         self._post("torrents/addTags", hashes=hashes, tags=tag_str)
 
+    def remove_tags(self, hashes, tags):
+        """Remove tags from torrents."""
+        tag_str = tags if isinstance(tags, str) else ",".join(tags)
+        self._post("torrents/removeTags", hashes=hashes, tags=tag_str)
+
     def set_super_seeding(self, hashes, value=True):
         """Toggle super seeding mode for given torrents."""
         self._post("torrents/setSuperSeeding", hashes=hashes, value="true" if value else "false")
@@ -133,6 +156,54 @@ class QBitClient:
         """Set individual download limit for torrent(s). Set to 0 for unlimited."""
         self._post("torrents/setDownloadLimit", hashes=hashes, limit=limit_bytes)
 
+    # ── Tracker Management ────────────────────────────────────────
+
+    def add_trackers(self, torrent_hash, urls):
+        """Add tracker URLs to a torrent. urls: list of tracker URLs or newline-separated string."""
+        if isinstance(urls, list):
+            urls = "\n".join(urls)
+        self._post("torrents/addTrackers", hash=torrent_hash, urls=urls)
+
+    def remove_trackers(self, torrent_hash, urls):
+        """Remove tracker URLs from a torrent."""
+        if isinstance(urls, list):
+            urls = "|".join(urls)
+        self._post("torrents/removeTrackers", hash=torrent_hash, urls=urls)
+
+    # ── Peer Management ───────────────────────────────────────────
+
+    def get_peer_data(self, torrent_hash):
+        """Get connected peers for a torrent."""
+        try:
+            return self._get("sync/torrentPeers", hash=torrent_hash)
+        except Exception:
+            return {}
+
+    def add_peers(self, hashes, peers):
+        """Manually add peers to torrent(s). peers: list of 'host:port' strings."""
+        peer_str = "|".join(peers) if isinstance(peers, list) else peers
+        self._post("torrents/addPeers", hashes=hashes, peers=peer_str)
+
+    def ban_peers(self, peers):
+        """Ban peers by IP. peers: list of 'host:port' strings."""
+        peer_str = "|".join(peers) if isinstance(peers, list) else peers
+        self._post("transfer/banPeers", peers=peer_str)
+
+    # ── Advanced Torrent Control ─────────────────────────────────
+
+    def set_force_start(self, hashes, value=True):
+        """Force start torrents, bypassing queue limits."""
+        self._post("torrents/setForceStart", hashes=hashes, value="true" if value else "false")
+
+    def set_torrent_priority(self, hashes, priority):
+        """Set torrent priority. priority: 'increasePrio', 'decreasePrio', 'topPrio', 'bottomPrio'."""
+        self._post(f"torrents/{priority}", hashes=hashes)
+
+    def set_share_limits(self, hashes, ratio_limit=-2, seeding_time_limit=-2):
+        """Set share ratio/time limits. -2=global, -1=unlimited, 0+=value."""
+        self._post("torrents/setShareLimits", hashes=hashes,
+                   ratioLimit=ratio_limit, seedingTimeLimit=seeding_time_limit)
+
     # ── Application Preferences ───────────────────────────────────
 
     def get_preferences(self):
@@ -141,8 +212,6 @@ class QBitClient:
 
     def set_preferences(self, prefs: dict):
         """Set application preferences."""
-        # Convert dict to json string for the form data
-        import json
         self._post("app/setPreferences", json=json.dumps(prefs))
 
     # ── Categories ────────────────────────────────────────────────
@@ -158,6 +227,3 @@ class QBitClient:
     def get_app_version(self):
         resp = self.session.get(f"{self.base_url}/app/version")
         return resp.text
-
-    def get_preferences(self):
-        return self._get("app/preferences")

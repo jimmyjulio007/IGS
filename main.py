@@ -4,7 +4,12 @@ import json
 import os
 import click
 from qbit_client import QBitClient
-from automation import AutomationEngine, StaleSeederRule, CleanupRule, AutoCategoryRule, RatioGuardRule, RaceRule, ISPEvasionRule, SniperRule, DictatorshipRule, HealingRule, AntiSpywareRule
+from automation import (
+    AutomationEngine, StaleSeederRule, CleanupRule, AutoCategoryRule,
+    RatioGuardRule, RaceRule, ISPEvasionRule, SniperRule, DictatorshipRule,
+    HealingRule, AntiSpywareRule, UploadGoalRule, NightRaidRule,
+    SwarmDominatorRule, TrackerBoosterRule, RevengeRule,
+)
 from notifier import load_notifier
 from tracker_stats import print_summary, format_bytes
 from database import init_db
@@ -31,7 +36,12 @@ DEFAULT_CONFIG = {
             "stale_seeder": {"enabled": True, "max_idle_hours": 48},
             "cleanup": {"enabled": True, "min_ratio": 2.0, "min_active_seed_hours": 72},
             "ratio_guard": {"enabled": True, "warn_ratio": 0.5},
-            "auto_category": {"enabled": False, "tracker_map": {}}
+            "auto_category": {"enabled": False, "tracker_map": {}},
+            "upload_goal": {"enabled": True, "target_tb": 1.0},
+            "night_raid": {"enabled": True, "raid_start_hour": 0, "raid_end_hour": 7},
+            "swarm_dominator": {"enabled": True, "max_seeders": 3, "min_leechers": 3},
+            "tracker_booster": {"enabled": True},
+            "revenge_rule": {"enabled": True, "revenge_below_ratio": 0.5, "min_downloaded_mb": 100}
         }
     },
     "telegram": {
@@ -114,6 +124,39 @@ def make_rules(config, notifier=None):
     if ac.get("enabled", False):
         rules.append(AutoCategoryRule(tracker_map=ac.get("tracker_map", {})))
 
+    ug = rules_cfg.get("upload_goal", {})
+    if ug.get("enabled", True):
+        target_bytes = int(ug.get("target_tb", 1.0) * 1024**4)
+        rules.append(UploadGoalRule(target_bytes=target_bytes, notifier=notifier))
+
+    nr = rules_cfg.get("night_raid", {})
+    if nr.get("enabled", True):
+        rules.append(NightRaidRule(
+            raid_start_hour=nr.get("raid_start_hour", 0),
+            raid_end_hour=nr.get("raid_end_hour", 7),
+            notifier=notifier,
+        ))
+
+    sd = rules_cfg.get("swarm_dominator", {})
+    if sd.get("enabled", True):
+        rules.append(SwarmDominatorRule(
+            max_seeders=sd.get("max_seeders", 3),
+            min_leechers=sd.get("min_leechers", 3),
+            notifier=notifier,
+        ))
+
+    tb = rules_cfg.get("tracker_booster", {})
+    if tb.get("enabled", True):
+        rules.append(TrackerBoosterRule())
+
+    rv = rules_cfg.get("revenge_rule", {})
+    if rv.get("enabled", True):
+        rules.append(RevengeRule(
+            revenge_below_ratio=rv.get("revenge_below_ratio", 0.5),
+            min_downloaded_mb=rv.get("min_downloaded_mb", 100),
+            notifier=notifier,
+        ))
+
     return rules
 
 
@@ -155,7 +198,7 @@ def start():
         click.secho("  📱 Telegram: Not configured (add bot_token + chat_id to config.json)", dim=True)
     click.echo("=" * 50)
 
-    engine = AutomationEngine(client, rules=rules, interval_sec=interval)
+    engine = AutomationEngine(client, rules=rules, interval_sec=interval, notifier=notifier)
     engine.start()
 
     # Start Freeleech Hunter if configured
@@ -198,6 +241,61 @@ def start():
         if torr9_instance:
             torr9_instance.stop()
         click.echo("[*] Stopped.")
+
+
+@cli.command()
+@click.option("--target-tb", default=None, type=float, help="Override target in TB (default: from config)")
+def goal(target_tb):
+    """Show upload goal progress and estimated time to reach 1 TB."""
+    config = load_config()
+    client = make_client(config)
+
+    ug_cfg = config.get("automation", {}).get("rules", {}).get("upload_goal", {})
+    target_tb = target_tb or ug_cfg.get("target_tb", 1.0)
+    target_bytes = int(target_tb * 1024**4)
+
+    torrents = client.get_torrents()
+    transfer = client.get_global_transfer_info()
+
+    total_uploaded = sum(t.get("uploaded", 0) for t in torrents)
+    up_speed = transfer.get("up_info_speed", 0)  # bytes/sec
+
+    pct = min((total_uploaded / target_bytes) * 100, 100.0)
+    remaining = max(target_bytes - total_uploaded, 0)
+
+    bar_filled = int(pct / 5)
+    bar = "█" * bar_filled + "░" * (20 - bar_filled)
+
+    # Determine phase
+    if pct >= 80:
+        phase, phase_icon, phase_color = "BEAST", "🔥", "red"
+    elif pct >= 50:
+        phase, phase_icon, phase_color = "ASSAULT", "⚔️", "yellow"
+    else:
+        phase, phase_icon, phase_color = "CRUISE", "🚢", "cyan"
+
+    click.secho("\n  🎯 IGS — Upload Goal Tracker", fg="cyan", bold=True)
+    click.secho("  " + "─" * 42, fg="cyan")
+    click.secho(f"  Phase   : {phase_icon} {phase}", fg=phase_color, bold=True)
+    click.echo(f"  Target  : {target_tb:.1f} TB  ({format_bytes(target_bytes)})")
+    click.echo(f"  Uploaded: {format_bytes(total_uploaded)}")
+    click.echo(f"  Speed   : {format_bytes(up_speed)}/s")
+    click.secho(f"\n  [{bar}] {pct:.1f}%\n", fg="green" if pct >= 100 else "yellow")
+
+    if pct >= 100:
+        click.secho("  🏆 GOAL REACHED! Congratulations!", fg="green", bold=True)
+    elif up_speed > 0:
+        eta_seconds = remaining / up_speed
+        if eta_seconds < 3600:
+            eta_str = f"{eta_seconds/60:.0f} minutes"
+        elif eta_seconds < 86400:
+            eta_str = f"{eta_seconds/3600:.1f} hours"
+        else:
+            eta_str = f"{eta_seconds/86400:.1f} days"
+        click.secho(f"  ETA     : ~{eta_str} at current speed", fg="cyan")
+    else:
+        click.secho("  ETA     : No active upload speed detected (nothing seeding?)", fg="red")
+    click.echo()
 
 
 @cli.command("list")
@@ -317,6 +415,147 @@ def secure_boost():
         click.secho("\nYour qBittorrent is now configured to vacuum swarms safely.", fg="green", bold=True)
     except Exception as e:
         click.secho(f"❌ Failed to push optimize payload to qBittorrent: {e}", fg="red")
+
+@cli.command()
+def beast():
+    """Activate Beast Mode: max performance, all rules ON, 60s interval, full throttle."""
+    config = load_config()
+    client = make_client(config)
+    notifier = load_notifier(config)
+
+    click.secho("", fg="red")
+    click.secho("  ╔══════════════════════════════════════════════╗", fg="red", bold=True)
+    click.secho("  ║         🔥 IGS BEAST MODE ACTIVATED 🔥       ║", fg="red", bold=True)
+    click.secho("  ╚══════════════════════════════════════════════╝", fg="red", bold=True)
+    click.secho("", fg="red")
+
+    # 1. Inject maximum performance settings
+    click.secho("  [1/4] Injecting extreme performance settings...", fg="yellow")
+    blocklist_url = "https://github.com/Naunter/BT_BlockLists/raw/master/bt_blocklists.gz"
+    beast_prefs = {
+        "max_connec": 4000,
+        "max_connec_per_torrent": 1000,
+        "max_uploads": 750,
+        "max_uploads_per_torrent": 150,
+        "max_half_open_connections": 200,
+        "choking_algorithm": 1,
+        "up_limit": 0,
+        "dl_limit": 0,
+        "dht": True,
+        "pex": True,
+        "lsd": True,
+        "ip_filter_enabled": True,
+        "ip_filter_path": blocklist_url,
+        "ip_filter_trackers": True,
+        "queueing_enabled": False,
+        "max_active_uploads": -1,
+        "max_active_torrents": -1,
+    }
+    try:
+        client.set_preferences(beast_prefs)
+        click.secho("    Max Connections: 4000 | Per-Torrent: 1000", fg="green")
+        click.secho("    Max Uploads: 750 | Half-Open: 200", fg="green")
+        click.secho("    Queueing: DISABLED (all torrents active)", fg="green")
+        click.secho("    DHT + PeX + LSD: ENABLED", fg="green")
+        click.secho("    IP Blocklist: ACTIVE", fg="green")
+    except Exception as e:
+        click.secho(f"    Failed: {e}", fg="red")
+
+    # 2. Force-start ALL seeding torrents
+    click.secho("  [2/4] Force-starting all seeders...", fg="yellow")
+    torrents = client.get_torrents()
+    seeders = [t for t in torrents if t.get("state") in ("uploading", "stalledUP", "pausedUP", "queuedUP")]
+    for t in seeders:
+        client.set_force_start(t["hash"], True)
+        if t.get("up_limit", 0) > 0:
+            client.set_upload_limit(t["hash"], 0)
+    click.secho(f"    Force-started {len(seeders)} torrent(s), all caps removed", fg="green")
+
+    # 3. Resume all paused seeders
+    paused = [t for t in torrents if t.get("state") == "pausedUP"]
+    if paused:
+        client.resume("|".join(t["hash"] for t in paused))
+        click.secho(f"    Resumed {len(paused)} paused seeder(s)", fg="green")
+
+    # 4. Start engine with ALL 15 rules at 60s interval
+    click.secho("  [3/4] Starting automation engine (60s interval, 15 rules)...", fg="yellow")
+
+    # Force all rules ON
+    rules_cfg = config.get("automation", {}).get("rules", {})
+    rules = []
+    rules.append(RaceRule(max_age_hours=rules_cfg.get("race_rule", {}).get("max_age_hours", 2)))
+    rules.append(ISPEvasionRule())
+    rules.append(SniperRule())
+    rules.append(DictatorshipRule(notifier=notifier))
+    rules.append(HealingRule())
+    rules.append(AntiSpywareRule(notifier=notifier))
+    rules.append(StaleSeederRule())
+    rules.append(CleanupRule())
+    rules.append(RatioGuardRule())
+    target_bytes = int(rules_cfg.get("upload_goal", {}).get("target_tb", 1.0) * 1024**4)
+    rules.append(UploadGoalRule(target_bytes=target_bytes, notifier=notifier))
+    rules.append(NightRaidRule(notifier=notifier))
+    rules.append(SwarmDominatorRule(notifier=notifier))
+    rules.append(TrackerBoosterRule())
+    rules.append(RevengeRule(notifier=notifier))
+    ac_cfg = rules_cfg.get("auto_category", {})
+    if ac_cfg.get("tracker_map"):
+        rules.append(AutoCategoryRule(tracker_map=ac_cfg.get("tracker_map", {})))
+
+    engine = AutomationEngine(client, rules=rules, interval_sec=60, notifier=notifier)
+    engine.start()
+    click.secho(f"    {len(rules)} rules active | 60s cycle | Adaptive interval ON", fg="green")
+
+    # 5. Start hunters
+    click.secho("  [4/4] Starting freeleech hunters...", fg="yellow")
+    fh_instance = None
+    fh_cfg = config.get("freeleech_hunter", {})
+    if fh_cfg.get("enabled", False):
+        from freeleech_hunter import FreeleechHunter, build_profiles
+        profiles = build_profiles(config)
+        if profiles:
+            fh_instance = FreeleechHunter(
+                client=client, profiles=profiles,
+                interval_sec=fh_cfg.get("interval_sec", 600),
+                notifier=notifier, max_per_run=fh_cfg.get("max_per_run", 5),
+            )
+            fh_instance.start()
+            click.secho(f"    Freeleech Hunter: ACTIVE ({len(profiles)} tracker(s))", fg="green")
+
+    from torr9_hunter import build_torr9_hunter
+    torr9_instance = build_torr9_hunter(config, client, notifier=notifier)
+    if torr9_instance:
+        torr9_instance.start()
+        mode = "Alert Only" if torr9_instance.notify_only else "Auto-Download"
+        click.secho(f"    Torr9 Hunter: ACTIVE ({mode})", fg="green")
+
+    click.secho("")
+    click.secho("  ══════════════════════════════════════════════", fg="red")
+    click.secho(f"  🔥 BEAST MODE RUNNING — {len(seeders)} seeders | {len(rules)} rules | 60s cycles", fg="red", bold=True)
+    click.secho("  ══════════════════════════════════════════════", fg="red")
+    click.secho("  Press Ctrl+C to stop.\n", dim=True)
+
+    if notifier and notifier.enabled:
+        notifier.send(
+            "🔥 <b>BEAST MODE ACTIVATED</b>\n\n"
+            f"🚀 {len(seeders)} seeders force-started\n"
+            f"⚙️ {len(rules)} rules active | 60s cycles\n"
+            f"📡 Connections: 4000 | Uploads: 750\n"
+            "All limits removed. Maximum upload."
+        )
+
+    try:
+        import time as _time
+        while True:
+            _time.sleep(1)
+    except KeyboardInterrupt:
+        engine.stop()
+        if fh_instance:
+            fh_instance.stop()
+        if torr9_instance:
+            torr9_instance.stop()
+        click.echo("[*] Beast Mode stopped.")
+
 
 cli.add_command(list_torrents, name="ls")
 cli.add_command(remove, name="rm")

@@ -323,10 +323,505 @@ class AntiSpywareRule(Rule):
         return actions
 
 
-class AutomationEngine:
-    """Runs rules on a schedule and records stats."""
+class UploadGoalRule(Rule):
+    """Upload Goal Tracker v2 — Adaptive 3-Phase Swarm Domination Engine.
 
-    def __init__(self, client: QBitClient, rules=None, interval_sec=300):
+    Phases scale aggression based on distance to goal:
+      PHASE 1 — CRUISE  (> 50% remaining): Uncap uploads, Super-Seed, periodic reannounce.
+      PHASE 2 — ASSAULT (20-50% remaining): + Force-start queued torrents, throttle downloads,
+                                               boost connections, prioritize high-leecher torrents.
+      PHASE 3 — BEAST   (< 20% remaining):  + Resume ALL paused seeders, kill all downloads,
+                                               force reannounce every cycle, max peer discovery.
+
+    Every phase is cumulative — Beast includes everything from Cruise and Assault.
+    """
+    name = "upload_goal_rule"
+
+    PHASE_CRUISE  = "CRUISE"
+    PHASE_ASSAULT = "ASSAULT"
+    PHASE_BEAST   = "BEAST"
+
+    def __init__(self, target_bytes: int = 1_099_511_627_776, notifier=None):  # Default: 1 TB
+        self.target_bytes = target_bytes
+        self.notifier = notifier
+        self._milestone_pct = 0
+        self._reannounce_cycle = 0  # Reannounce every N cycles (not every cycle in Cruise)
+        self._phase = self.PHASE_CRUISE
+        self._beast_paused_dl = set()  # Track downloads we paused in Beast mode
+
+    def _get_phase(self, pct):
+        """Determine aggression phase based on progress."""
+        if pct >= 80:
+            return self.PHASE_BEAST
+        elif pct >= 50:
+            return self.PHASE_ASSAULT
+        return self.PHASE_CRUISE
+
+    def evaluate(self, client, torrents):
+        actions = []
+        self._reannounce_cycle += 1
+
+        # ── 0. Calculate progress ────────────────────────────────
+        total_uploaded = sum(t.get("uploaded", 0) for t in torrents)
+        pct = min((total_uploaded / self.target_bytes) * 100, 100.0) if self.target_bytes > 0 else 0
+        self._phase = self._get_phase(pct)
+
+        seeding = [t for t in torrents if t.get("state") in ("uploading", "stalledUP", "forcedUP")]
+        queued  = [t for t in torrents if t.get("state") == "queuedUP"]
+        paused  = [t for t in torrents if t.get("state") == "pausedUP"]
+        downloading = [t for t in torrents if t.get("state") in ("downloading", "stalledDL", "forcedDL")]
+
+        # ── PHASE 1: CRUISE (always active) ──────────────────────
+
+        # 1a. Remove per-torrent upload caps on ALL seeding torrents
+        capped = [t["hash"] for t in seeding + queued if t.get("up_limit", -1) > 0]
+        if capped:
+            client.set_upload_limit("|".join(capped), 0)
+            actions.append(f"[{self._phase}] Uncapped upload on {len(capped)} torrent(s)")
+
+        # 1b. Enable Super-Seeding on torrents with leechers
+        for t in seeding:
+            if t.get("num_leechs", 0) >= 1 and not t.get("super_seeding", False):
+                try:
+                    client.set_super_seeding(t["hash"], True)
+                except Exception:
+                    pass
+
+        # 1c. Periodic reannounce (every 3 cycles in Cruise, every cycle in higher phases)
+        reannounce_interval = 1 if self._phase != self.PHASE_CRUISE else 3
+        if self._reannounce_cycle % reannounce_interval == 0:
+            reannounce_targets = [t for t in seeding if t.get("num_leechs", 0) >= 1]
+            if reannounce_targets:
+                client.reannounce("|".join(t["hash"] for t in reannounce_targets))
+                actions.append(f"[{self._phase}] Reannounced {len(reannounce_targets)} active seeder(s)")
+
+        # 1d. Remove global upload speed limit if set
+        try:
+            prefs = client.get_preferences()
+            if prefs.get("up_limit", 0) > 0:
+                client.set_preferences({"up_limit": 0})
+                actions.append(f"[{self._phase}] Removed global upload speed cap")
+        except Exception:
+            pass
+
+        # ── PHASE 2: ASSAULT (50%+ progress) ─────────────────────
+        if self._phase in (self.PHASE_ASSAULT, self.PHASE_BEAST):
+
+            # 2a. Force-start ALL queued seeding torrents (bypass queue limit)
+            if queued:
+                for t in queued:
+                    client.set_force_start(t["hash"], True)
+                actions.append(f"[{self._phase}] Force-started {len(queued)} queued torrent(s)")
+
+            # 2b. Prioritize torrents by leecher demand (best ratio opportunities first)
+            high_demand = sorted(seeding, key=lambda t: t.get("num_leechs", 0), reverse=True)
+            if high_demand and high_demand[0].get("num_leechs", 0) >= 3:
+                top_hashes = [t["hash"] for t in high_demand[:5]]
+                for h in top_hashes:
+                    try:
+                        client.set_torrent_priority(h, "topPrio")
+                    except Exception:
+                        pass
+                actions.append(f"[{self._phase}] Boosted priority on top {len(top_hashes)} high-demand torrent(s)")
+
+            # 2c. Throttle download speed to give upload maximum bandwidth
+            try:
+                prefs = client.get_preferences()
+                current_dl_limit = prefs.get("dl_limit", 0)
+                # In Assault: throttle to 512 KB/s — in Beast: kill downloads entirely (see below)
+                target_dl = 0 if self._phase == self.PHASE_BEAST else 512 * 1024
+                if current_dl_limit != target_dl:
+                    client.set_preferences({"dl_limit": target_dl})
+                    if target_dl > 0:
+                        actions.append(f"[{self._phase}] Throttled global download to {target_dl // 1024} KB/s")
+                    else:
+                        actions.append(f"[{self._phase}] Killed global download limit (Beast override)")
+            except Exception:
+                pass
+
+            # 2d. Boost connection settings for maximum swarm penetration
+            try:
+                prefs = client.get_preferences()
+                boosts = {}
+                if prefs.get("max_connec", 0) < 3000:
+                    boosts["max_connec"] = 3000
+                if prefs.get("max_connec_per_torrent", 0) < 750:
+                    boosts["max_connec_per_torrent"] = 750
+                if prefs.get("max_uploads", 0) < 500:
+                    boosts["max_uploads"] = 500
+                if prefs.get("max_uploads_per_torrent", 0) < 100:
+                    boosts["max_uploads_per_torrent"] = 100
+                # Enable DHT, PeX, LSD for maximum peer discovery
+                if not prefs.get("dht", True):
+                    boosts["dht"] = True
+                if not prefs.get("pex", True):
+                    boosts["pex"] = True
+                if not prefs.get("lsd", True):
+                    boosts["lsd"] = True
+                if boosts:
+                    client.set_preferences(boosts)
+                    actions.append(f"[{self._phase}] Boosted connection limits & peer discovery ({len(boosts)} setting(s))")
+            except Exception:
+                pass
+
+        # ── PHASE 3: BEAST MODE (80%+ progress) ─────────────────
+        if self._phase == self.PHASE_BEAST:
+
+            # 3a. Resume ALL paused seeders — every torrent must contribute
+            if paused:
+                resume_hashes = [t["hash"] for t in paused]
+                client.resume("|".join(resume_hashes))
+                for h in resume_hashes:
+                    client.set_force_start(h, True)
+                actions.append(f"[BEAST] Force-resumed {len(resume_hashes)} paused seeder(s)")
+
+            # 3b. Pause active downloads to free 100% bandwidth for upload
+            if downloading:
+                dl_hashes = [t["hash"] for t in downloading]
+                client.pause("|".join(dl_hashes))
+                self._beast_paused_dl.update(dl_hashes)
+                actions.append(f"[BEAST] Paused {len(dl_hashes)} download(s) — 100% upload focus")
+
+            # 3c. Force reannounce on ALL seeders (not just active ones)
+            all_seed_hashes = [t["hash"] for t in seeding + queued]
+            if all_seed_hashes:
+                client.reannounce("|".join(all_seed_hashes))
+
+            # 3d. Remove any per-torrent download limits that waste bandwidth
+            dl_limited = [t["hash"] for t in seeding if t.get("dl_limit", 0) > 0]
+            if dl_limited:
+                client.set_download_limit("|".join(dl_limited), 0)
+
+        # ── Restore downloads if we drop back from Beast ─────────
+        if self._phase != self.PHASE_BEAST and self._beast_paused_dl:
+            still_paused = [t["hash"] for t in torrents if t["hash"] in self._beast_paused_dl and t.get("state") == "pausedDL"]
+            if still_paused:
+                client.resume("|".join(still_paused))
+                actions.append(f"[{self._phase}] Restored {len(still_paused)} download(s) (exited Beast Mode)")
+            self._beast_paused_dl.clear()
+            # Restore download limit
+            try:
+                client.set_preferences({"dl_limit": 0})
+            except Exception:
+                pass
+
+        # ── Progress bar & milestones ────────────────────────────
+        target_gb = self.target_bytes / (1024**3)
+        uploaded_gb = total_uploaded / (1024**3)
+        bar_filled = int(pct / 5)
+        bar = "█" * bar_filled + "░" * (20 - bar_filled)
+        phase_icon = {"CRUISE": "🚢", "ASSAULT": "⚔️", "BEAST": "🔥"}[self._phase]
+        actions.append(
+            f"{phase_icon} Upload Goal [{self._phase}]: [{bar}] {uploaded_gb:.1f} GB / {target_gb:.0f} GB ({pct:.1f}%)"
+        )
+
+        # Notify at milestones (25%, 50%, 75%, 100%)
+        for milestone in [25, 50, 75, 100]:
+            if pct >= milestone and self._milestone_pct < milestone:
+                self._milestone_pct = milestone
+                if self.notifier:
+                    emoji = "🏆" if milestone == 100 else "🎯"
+                    phase_msg = f"\n⚡ Phase: <b>{self._phase}</b>" if milestone < 100 else ""
+                    self.notifier.send(
+                        f"{emoji} <b>Upload Milestone: {milestone}%!</b>\n\n"
+                        f"📈 {uploaded_gb:.1f} GB / {target_gb:.0f} GB uploaded{phase_msg}\n"
+                        f"Keep seeding!"
+                    )
+                break
+
+        return actions
+
+
+class NightRaidRule(Rule):
+    """Full throttle during off-peak hours. Removes ALL speed limits at night,
+    force-starts every torrent, and reannounces everything to maximize overnight upload.
+
+    Night = free bandwidth. Day = ISP evasion. This rule is the inverse of ISPEvasionRule.
+    """
+    name = "night_raid"
+
+    def __init__(self, raid_start_hour=0, raid_end_hour=7, notifier=None):
+        self.raid_start_hour = raid_start_hour
+        self.raid_end_hour = raid_end_hour
+        self.notifier = notifier
+        self._raiding = False
+        self._raid_cycle = 0
+
+    def _is_raid_time(self):
+        hour = datetime.now().hour
+        if self.raid_start_hour < self.raid_end_hour:
+            return self.raid_start_hour <= hour < self.raid_end_hour
+        return hour >= self.raid_start_hour or hour < self.raid_end_hour
+
+    def evaluate(self, client, torrents):
+        actions = []
+
+        if self._is_raid_time():
+            if not self._raiding:
+                self._raiding = True
+                self._raid_cycle = 0
+                if self.notifier:
+                    self.notifier.send(
+                        "🌙 <b>NIGHT RAID ENGAGED</b>\n\n"
+                        "All limits removed. Every torrent force-started.\n"
+                        "Maximum upload until dawn."
+                    )
+
+            self._raid_cycle += 1
+
+            # Remove ALL global speed limits
+            try:
+                client.set_preferences({"up_limit": 0, "dl_limit": 0})
+            except Exception:
+                pass
+
+            # Disable alternative speed mode if active
+            try:
+                if client.get_speed_limits_mode() == 1:
+                    client.toggle_speed_limits_mode()
+                    actions.append("[NIGHT RAID] Disabled alt speed limits — full power")
+            except Exception:
+                pass
+
+            # Force-start all paused/queued seeding torrents
+            resumable = [t for t in torrents if t.get("state") in ("pausedUP", "queuedUP")]
+            if resumable:
+                for t in resumable:
+                    client.set_force_start(t["hash"], True)
+                actions.append(f"[NIGHT RAID] Force-started {len(resumable)} torrent(s)")
+
+            # Uncap everything
+            capped = [t["hash"] for t in torrents if t.get("up_limit", 0) > 0]
+            if capped:
+                client.set_upload_limit("|".join(capped), 0)
+                actions.append(f"[NIGHT RAID] Uncapped {len(capped)} torrent(s)")
+
+            # Reannounce every 2 cycles to find new peers
+            if self._raid_cycle % 2 == 0:
+                seeding = [t for t in torrents if t.get("state") in ("uploading", "stalledUP", "forcedUP")]
+                if seeding:
+                    client.reannounce("|".join(t["hash"] for t in seeding))
+                    actions.append(f"[NIGHT RAID] Reannounced {len(seeding)} seeder(s)")
+
+            if self._raid_cycle == 1:
+                actions.append("[NIGHT RAID] Engaged — all limits removed, maximum upload")
+
+        elif self._raiding:
+            self._raiding = False
+            self._raid_cycle = 0
+            actions.append("[NIGHT RAID] Ended — daytime mode restored")
+            if self.notifier:
+                self.notifier.send(
+                    "🌅 <b>Night Raid Ended</b>\n\n"
+                    "Daytime speed management restored.",
+                    silent=True,
+                )
+
+        return actions
+
+
+class SwarmDominatorRule(Rule):
+    """Detect swarms where you are one of very few seeders (1-3) with many leechers.
+    Aggressively optimize these torrents: Super-Seed, max connections, force reannounce,
+    and set unlimited share ratio to farm maximum upload from your dominant position."""
+    name = "swarm_dominator"
+
+    def __init__(self, max_seeders=3, min_leechers=3, notifier=None):
+        self.max_seeders = max_seeders
+        self.min_leechers = min_leechers
+        self.notifier = notifier
+        self._dominated = set()
+
+    def evaluate(self, client, torrents):
+        actions = []
+
+        dominant = []
+        for t in torrents:
+            if t.get("state") not in ("uploading", "stalledUP", "forcedUP"):
+                continue
+            seeds = t.get("num_seeds", 0)
+            leechs = t.get("num_leechs", 0)
+            if seeds <= self.max_seeders and leechs >= self.min_leechers:
+                dominant.append(t)
+
+        for t in dominant:
+            h = t["hash"]
+
+            # Enable super seeding for piece-optimal distribution
+            if not t.get("super_seeding", False):
+                try:
+                    client.set_super_seeding(h, True)
+                except Exception:
+                    pass
+
+            # Force-start to bypass queue
+            client.set_force_start(h, True)
+
+            # Uncap upload
+            if t.get("up_limit", 0) > 0:
+                client.set_upload_limit(h, 0)
+
+            # Set unlimited share ratio (keep seeding forever)
+            try:
+                client.set_share_limits(h, ratio_limit=-1, seeding_time_limit=-1)
+            except Exception:
+                pass
+
+            # Force reannounce to attract more peers
+            client.reannounce(h)
+
+            # Tag for dashboard visibility
+            if "DOMINATED" not in t.get("tags", ""):
+                client.add_tags(h, "DOMINATED")
+
+            if h not in self._dominated:
+                self._dominated.add(h)
+                ratio = f"{t.get('ratio', 0):.2f}"
+                actions.append(
+                    f"[DOMINATOR] Seized swarm: {t['name'][:35]} "
+                    f"(Seeds: {t.get('num_seeds', 0)}, Leechs: {t.get('num_leechs', 0)}, Ratio: {ratio})"
+                )
+                if self.notifier:
+                    self.notifier.send(
+                        f"👊 <b>Swarm Dominated</b>\n\n"
+                        f"📦 <code>{t['name'][:50]}</code>\n"
+                        f"🌱 Seeders: <b>{t.get('num_seeds', 0)}</b> | "
+                        f"👥 Leechers: <b>{t.get('num_leechs', 0)}</b>\n"
+                        f"Super-Seed + Force-Start + Unlimited ratio active."
+                    )
+
+        # Clean up tags for torrents no longer dominated
+        current_dominant_hashes = {t["hash"] for t in dominant}
+        lost = self._dominated - current_dominant_hashes
+        for h in lost:
+            self._dominated.discard(h)
+            try:
+                client.remove_tags(h, "DOMINATED")
+            except Exception:
+                pass
+
+        return actions
+
+
+class TrackerBoosterRule(Rule):
+    """Inject well-known public UDP trackers into all torrents to maximize peer discovery.
+    Only adds to torrents that don't already have these trackers.
+    Runs once per torrent (tracked by hash)."""
+    name = "tracker_booster"
+
+    PUBLIC_TRACKERS = [
+        "udp://tracker.opentrackr.org:1337/announce",
+        "udp://open.demonii.com:1337/announce",
+        "udp://tracker.openbittorrent.com:6969/announce",
+        "udp://exodus.desync.com:6969/announce",
+        "udp://tracker.torrent.eu.org:451/announce",
+        "udp://open.stealth.si:80/announce",
+    ]
+
+    def __init__(self):
+        self._boosted_hashes = set()
+
+    def evaluate(self, client, torrents):
+        actions = []
+        for t in torrents:
+            h = t["hash"]
+            if h in self._boosted_hashes:
+                continue
+
+            try:
+                existing = client.get_trackers(h)
+                existing_urls = {tr.get("url", "") for tr in existing}
+
+                new_trackers = [u for u in self.PUBLIC_TRACKERS if u not in existing_urls]
+                if new_trackers:
+                    client.add_trackers(h, new_trackers)
+                    actions.append(f"[BOOSTER] Injected {len(new_trackers)} tracker(s) into {t['name'][:35]}")
+            except Exception:
+                pass
+
+            self._boosted_hashes.add(h)
+
+        return actions
+
+
+class RevengeRule(Rule):
+    """Identify torrents where you downloaded a lot but uploaded very little (ratio < threshold).
+    Force-seed these aggressively: uncap, super-seed, force-start, reannounce.
+    Goal: Pay back what you took and build ratio on torrents that hurt you."""
+    name = "revenge_rule"
+
+    def __init__(self, revenge_below_ratio=0.5, min_downloaded_mb=100, notifier=None):
+        self.revenge_ratio = revenge_below_ratio
+        self.min_downloaded = min_downloaded_mb * 1024 * 1024
+        self.notifier = notifier
+        self._revenging = set()
+
+    def evaluate(self, client, torrents):
+        actions = []
+
+        for t in torrents:
+            h = t["hash"]
+            if t.get("state") not in ("uploading", "stalledUP", "forcedUP", "pausedUP", "queuedUP"):
+                continue
+
+            downloaded = t.get("downloaded", 0)
+            ratio = t.get("ratio", 0)
+
+            if downloaded >= self.min_downloaded and ratio < self.revenge_ratio:
+                # This torrent is hurting our ratio — attack it
+                if t.get("state") in ("pausedUP", "queuedUP"):
+                    client.resume(h)
+                    client.set_force_start(h, True)
+
+                if t.get("up_limit", 0) > 0:
+                    client.set_upload_limit(h, 0)
+
+                if not t.get("super_seeding", False) and t.get("num_leechs", 0) >= 1:
+                    try:
+                        client.set_super_seeding(h, True)
+                    except Exception:
+                        pass
+
+                # Set unlimited share ratio
+                try:
+                    client.set_share_limits(h, ratio_limit=-1, seeding_time_limit=-1)
+                except Exception:
+                    pass
+
+                # Tag it
+                if "REVENGE" not in t.get("tags", ""):
+                    client.add_tags(h, "REVENGE")
+
+                if h not in self._revenging:
+                    self._revenging.add(h)
+                    actions.append(
+                        f"[REVENGE] Targeting {t['name'][:35]} "
+                        f"(DL: {downloaded / (1024**3):.1f} GB, Ratio: {ratio:.2f})"
+                    )
+
+            elif h in self._revenging and ratio >= self.revenge_ratio:
+                # Ratio recovered — mission accomplished
+                self._revenging.discard(h)
+                try:
+                    client.remove_tags(h, "REVENGE")
+                except Exception:
+                    pass
+                actions.append(f"[REVENGE] Mission complete: {t['name'][:35]} (Ratio: {ratio:.2f})")
+                if self.notifier:
+                    self.notifier.send(
+                        f"✅ <b>Revenge Complete</b>\n\n"
+                        f"📦 <code>{t['name'][:50]}</code>\n"
+                        f"📊 Ratio recovered to <b>{ratio:.2f}</b>",
+                        silent=True,
+                    )
+
+        return actions
+
+
+class AutomationEngine:
+    """Beast-mode automation engine with adaptive intervals and daily digest."""
+
+    def __init__(self, client: QBitClient, rules=None, interval_sec=300, notifier=None):
         self.client = client
         self.rules = rules or [
             StaleSeederRule(),
@@ -339,10 +834,16 @@ class AutomationEngine:
             HealingRule(),
             AntiSpywareRule(),
         ]
+        self.base_interval = interval_sec
         self.interval = interval_sec
+        self.notifier = notifier
         self._stop = threading.Event()
         self._thread = None
         self.last_actions = []
+        self.cycle_count = 0
+        self.total_actions = 0
+        self._last_digest_hour = -1
+        self._session_start = time.time()
 
     def run_once(self):
         """Execute all rules once and record stats."""
@@ -362,15 +863,63 @@ class AutomationEngine:
                     actions.append(f"[ERROR] Rule '{rule.name}': {e}")
 
         self.last_actions = actions
+        self.cycle_count += 1
+        self.total_actions += len(actions)
+
+        # Adaptive interval: if many actions fired, check more frequently
+        action_count = len([a for a in actions if not a.startswith("[ERROR]")])
+        if action_count >= 10:
+            self.interval = max(self.base_interval // 3, 60)
+        elif action_count >= 5:
+            self.interval = max(self.base_interval // 2, 90)
+        else:
+            self.interval = self.base_interval
+
         return actions
+
+    def _send_daily_digest(self, transfer, torrents):
+        """Send a daily Telegram digest at a configured hour."""
+        current_hour = datetime.now().hour
+        if current_hour != 8 or self._last_digest_hour == current_hour:
+            return
+        if not self.notifier or not self.notifier.enabled:
+            return
+
+        self._last_digest_hour = current_hour
+        total_up = sum(t.get("uploaded", 0) for t in torrents)
+        total_dl = sum(t.get("downloaded", 0) for t in torrents)
+        ratio = total_up / max(total_dl, 1)
+        seeding = sum(1 for t in torrents if t.get("state", "").startswith("upload") or t.get("state") == "stalledUP")
+        up_speed = transfer.get("up_info_speed", 0)
+        uptime = (time.time() - self._session_start) / 3600
+
+        from tracker_stats import format_bytes, format_speed
+        self.notifier.send(
+            f"📊 <b>IGS Daily Digest</b>\n\n"
+            f"⬆️ Total Uploaded: <b>{format_bytes(total_up)}</b>\n"
+            f"📈 Global Ratio: <b>{ratio:.3f}</b>\n"
+            f"🌱 Seeding: <b>{seeding}</b> / {len(torrents)} torrents\n"
+            f"⚡ Current Speed: <b>{format_speed(up_speed)}</b>\n"
+            f"🔄 Engine Cycles: <b>{self.cycle_count}</b> ({self.total_actions} actions)\n"
+            f"⏱️ Uptime: <b>{uptime:.1f}h</b>"
+        )
 
     def _loop(self):
         while not self._stop.is_set():
             try:
                 actions = self.run_once()
+
+                # Try daily digest
+                try:
+                    transfer = self.client.get_global_transfer_info()
+                    torrents = self.client.get_torrents()
+                    self._send_daily_digest(transfer, torrents)
+                except Exception:
+                    pass
+
                 if actions:
                     timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                    print(f"[{timestamp}] Automation ran {len(actions)} action(s):")
+                    print(f"[{timestamp}] Cycle #{self.cycle_count} — {len(actions)} action(s) (next in {self.interval}s):")
                     for a in actions:
                         print(f"  - {a}")
             except Exception as e:
@@ -380,6 +929,7 @@ class AutomationEngine:
     def start(self):
         """Start the automation loop in a background thread."""
         self._stop.clear()
+        self._session_start = time.time()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         print(f"[Automation] Started (interval: {self.interval}s, rules: {len(self.rules)})")
@@ -389,4 +939,4 @@ class AutomationEngine:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
-        print("[Automation] Stopped.")
+        print(f"[Automation] Stopped after {self.cycle_count} cycles, {self.total_actions} total actions.")
