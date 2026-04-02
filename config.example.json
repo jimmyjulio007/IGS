@@ -1,0 +1,41 @@
+{
+    "qbittorrent": {
+        "host": "http://localhost",
+        "port": 8080,
+        "username": "",
+        "password": ""
+    },
+    "automation": {
+        "enabled": true,
+        "interval_sec": 300,
+        "rules": {
+            "race_rule":         { "enabled": true, "max_age_hours": 2, "min_leechers": 1 },
+            "isp_evasion":       { "enabled": true, "peak_start_hour": 18, "peak_end_hour": 23 },
+            "sniper_rule":       { "enabled": true, "min_speed_kbps": 50, "demand_leechers": 3 },
+            "dictatorship_rule": { "enabled": true, "trigger_leechers": 2 },
+            "healing_rule":      { "enabled": true },
+            "anti_spyware":      { "enabled": true },
+            "stale_seeder":      { "enabled": true, "max_idle_hours": 48 },
+            "cleanup":           { "enabled": true, "min_ratio": 2.0, "min_active_seed_hours": 72 },
+            "ratio_guard":       { "enabled": true, "warn_ratio": 0.5 },
+            "auto_category":     { "enabled": false, "tracker_map": {} }
+        }
+    },
+    "telegram": {
+        "bot_token": "",
+        "chat_id": ""
+    },
+    "freeleech_hunter": {
+        "enabled": false,
+        "interval_sec": 600,
+        "max_per_run": 5,
+        "trackers": {}
+    },
+    "torr9": {
+        "enabled": false,
+        "jwt_token": "",
+        "interval_sec": 600,
+        "max_per_run": 5,
+        "notify_only": true
+    }
+}
