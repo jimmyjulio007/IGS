@@ -732,6 +732,16 @@ class TrackerBoosterRule(Rule):
                 existing = client.get_trackers(h)
                 existing_urls = {tr.get("url", "") for tr in existing}
 
+                # Skip private torrents — public trackers are useless and get "Disabled"
+                is_private = any(
+                    "private" in tr.get("msg", "").lower()
+                    for tr in existing
+                    if tr.get("url", "").startswith("**")
+                )
+                if is_private:
+                    self._boosted_hashes.add(h)
+                    continue
+
                 new_trackers = [u for u in self.PUBLIC_TRACKERS if u not in existing_urls]
                 if new_trackers:
                     client.add_trackers(h, new_trackers)
@@ -814,6 +824,113 @@ class RevengeRule(Rule):
                         f"📊 Ratio recovered to <b>{ratio:.2f}</b>",
                         silent=True,
                     )
+
+        return actions
+
+
+class BandwidthOptimizerRule(Rule):
+    """Smart bandwidth allocation: score each torrent by upload potential,
+    funnel bandwidth to the highest-ROI opportunities, starve the rest.
+
+    Score = (leechers / (seeders + 1)) * torrent_size_weight
+    Higher score = more upload opportunity = gets unlimited bandwidth.
+    Bottom torrents get throttled to free bandwidth for top earners.
+    """
+    name = "bandwidth_optimizer"
+
+    def __init__(self, top_pct=0.3, throttle_kbps=25):
+        self.top_pct = top_pct  # Top 30% get full bandwidth
+        self.throttle_kbps = throttle_kbps
+
+    def evaluate(self, client, torrents):
+        actions = []
+        seeding = [t for t in torrents if t.get("state") in ("uploading", "stalledUP", "forcedUP")]
+        if len(seeding) < 3:
+            return actions
+
+        # Score each torrent: higher = better upload opportunity
+        scored = []
+        for t in seeding:
+            leechers = t.get("num_leechs", 0)
+            seeders = t.get("num_seeds", 0)
+            size_gb = t.get("size", 0) / (1024**3)
+            # Ratio opportunity: more leechers per seeder = gold
+            opportunity = leechers / max(seeders + 1, 1)
+            # Bigger torrents = more data per leecher = more upload
+            size_bonus = min(size_gb / 10, 3.0)  # Cap at 3x for 30GB+
+            score = opportunity * (1 + size_bonus)
+            scored.append((t, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        cutoff = max(int(len(scored) * self.top_pct), 1)
+        top_tier = scored[:cutoff]
+        bottom_tier = scored[cutoff:]
+
+        # Unleash top tier
+        unleashed = 0
+        for t, score in top_tier:
+            if t.get("up_limit", 0) > 0:
+                client.set_upload_limit(t["hash"], 0)
+                unleashed += 1
+
+        # Throttle bottom tier (only if they have 0 leechers or very low score)
+        throttled = 0
+        for t, score in bottom_tier:
+            if score < 0.1 and t.get("up_limit", 0) != self.throttle_kbps * 1024:
+                client.set_upload_limit(t["hash"], self.throttle_kbps * 1024)
+                throttled += 1
+
+        if unleashed or throttled:
+            actions.append(
+                f"[OPTIMIZER] Bandwidth: {len(top_tier)} torrents unleashed, "
+                f"{throttled} low-opportunity throttled to {self.throttle_kbps}KB/s"
+            )
+
+        return actions
+
+
+class PeerBlitzRule(Rule):
+    """Aggressive peer discovery: force reannounce on torrents with leechers
+    but low upload speed. Detect stale peer connections and force reconnection.
+    Runs every cycle to keep peer lists fresh."""
+    name = "peer_blitz"
+
+    def __init__(self, min_leechers=1, speed_threshold_kbps=10):
+        self.min_leechers = min_leechers
+        self.speed_threshold = speed_threshold_kbps * 1024
+        self._last_reannounce = {}
+
+    def evaluate(self, client, torrents):
+        actions = []
+        now = time.time()
+
+        for t in torrents:
+            if t.get("state") not in ("uploading", "stalledUP", "forcedUP"):
+                continue
+
+            leechers = t.get("num_leechs", 0)
+            up_speed = t.get("up_speed", 0)
+            h = t["hash"]
+
+            # Torrent has leechers but barely uploading = stale connections
+            if leechers >= self.min_leechers and up_speed < self.speed_threshold:
+                last = self._last_reannounce.get(h, 0)
+                # Don't spam reannounce — minimum 90s between
+                if now - last > 90:
+                    client.reannounce(h)
+                    self._last_reannounce[h] = now
+
+                    # If stalled, force restart to reset peer connections
+                    if t.get("state") == "stalledUP":
+                        client.set_force_start(h, True)
+                        actions.append(
+                            f"[BLITZ] Revived stalled: {t['name'][:35]} "
+                            f"({leechers} leechers, {up_speed//1024}KB/s)"
+                        )
+
+        # Cleanup old entries
+        active_hashes = {t["hash"] for t in torrents}
+        self._last_reannounce = {h: ts for h, ts in self._last_reannounce.items() if h in active_hashes}
 
         return actions
 

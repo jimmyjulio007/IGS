@@ -3,5 +3,6 @@ __pycache__/
 *.pyo
 config.json
 igs_stats.db
-.env
 Torr9.ROMS.WII.FULL.SET.MULTI-NoTag.torrent
+config.bat
+node_modules
