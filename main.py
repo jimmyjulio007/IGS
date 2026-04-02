@@ -417,6 +417,250 @@ def secure_boost():
         click.secho(f"❌ Failed to push optimize payload to qBittorrent: {e}", fg="red")
 
 @cli.command()
+def diagnose():
+    """Diagnose why upload isn't increasing — checks every possible bottleneck."""
+    config = load_config()
+    client = make_client(config)
+
+    click.secho("\n  🔍 IGS — Upload Diagnostic Report", fg="cyan", bold=True)
+    click.secho("  " + "═" * 50, fg="cyan")
+
+    issues = []
+    warnings = []
+    good = []
+
+    # 1. Connection check
+    try:
+        version = client.get_app_version()
+        good.append(f"qBittorrent connected (v{version})")
+    except Exception as e:
+        issues.append(f"Cannot connect to qBittorrent: {e}")
+        click.secho("\n  CRITICAL: Cannot reach qBittorrent. Fix connection first.", fg="red", bold=True)
+        return
+
+    # 2. Get all data
+    torrents = client.get_torrents()
+    transfer = client.get_global_transfer_info()
+    prefs = client.get_preferences()
+
+    # 3. Check if any torrents exist
+    if not torrents:
+        issues.append("No torrents loaded! Add torrents to start uploading.")
+        click.secho("\n  CRITICAL: No torrents in qBittorrent. Add content first.", fg="red", bold=True)
+        return
+
+    # 4. Torrent state analysis
+    seeding = [t for t in torrents if t.get("state") in ("uploading", "stalledUP", "forcedUP")]
+    paused = [t for t in torrents if t.get("state") in ("pausedUP", "pausedDL")]
+    queued = [t for t in torrents if t.get("state") in ("queuedUP", "queuedDL")]
+    errored = [t for t in torrents if t.get("state") == "error"]
+    downloading = [t for t in torrents if t.get("state") in ("downloading", "stalledDL", "forcedDL")]
+    active_uploading = [t for t in torrents if t.get("state") == "uploading"]
+    stalled = [t for t in torrents if t.get("state") == "stalledUP"]
+
+    click.echo(f"\n  Torrents: {len(torrents)} total")
+    click.echo(f"    Active uploading : {len(active_uploading)}")
+    click.echo(f"    Stalled (UP)     : {len(stalled)}")
+    click.echo(f"    Paused           : {len(paused)}")
+    click.echo(f"    Queued           : {len(queued)}")
+    click.echo(f"    Downloading      : {len(downloading)}")
+    click.echo(f"    Errored          : {len(errored)}")
+
+    if not seeding:
+        issues.append("NO torrents are seeding! Everything is paused/queued/downloading.")
+    elif not active_uploading:
+        warnings.append(f"{len(stalled)} torrents seeding but ALL stalled (no peers downloading from you).")
+
+    if paused:
+        warnings.append(f"{len(paused)} torrent(s) are paused — they contribute nothing.")
+
+    if queued:
+        issues.append(f"{len(queued)} torrent(s) are QUEUED (waiting). Disable queue limits or force-start them.")
+
+    if errored:
+        issues.append(f"{len(errored)} torrent(s) in ERROR state:")
+        for t in errored[:3]:
+            issues.append(f"  - {t['name'][:50]}")
+
+    # 5. Leecher analysis — THE #1 REASON for no upload
+    total_leechers = sum(t.get("num_leechs", 0) for t in seeding)
+    torrents_with_leechers = [t for t in seeding if t.get("num_leechs", 0) > 0]
+
+    click.echo(f"\n  Leecher Analysis:")
+    click.echo(f"    Total leechers across seeding torrents: {total_leechers}")
+    click.echo(f"    Torrents with 1+ leechers: {len(torrents_with_leechers)} / {len(seeding)}")
+
+    if total_leechers == 0:
+        issues.append(
+            "ZERO LEECHERS on all your torrents! Nobody is downloading from you.\n"
+            "      → This is the #1 reason for no upload.\n"
+            "      → You need to seed POPULAR content with active leechers.\n"
+            "      → Add new/trending torrents, or Freeleech content."
+        )
+    elif len(torrents_with_leechers) < 3:
+        warnings.append(f"Only {len(torrents_with_leechers)} torrent(s) have leechers. Add more popular content.")
+
+    # Top torrents by leechers
+    if torrents_with_leechers:
+        click.echo(f"\n  Top torrents by demand:")
+        for t in sorted(torrents_with_leechers, key=lambda x: x.get("num_leechs", 0), reverse=True)[:5]:
+            speed = format_bytes(t.get("up_speed", 0))
+            click.echo(
+                f"    {t['name'][:40]:<40} "
+                f"Leechs: {t.get('num_leechs', 0):>3} | "
+                f"Seeds: {t.get('num_seeds', 0):>3} | "
+                f"Speed: {speed}/s"
+            )
+
+    # 6. Port / Firewall check (connection_status in transfer info)
+    click.echo(f"\n  Network:")
+    conn_status = transfer.get("connection_status", "unknown")
+    listen_port = prefs.get("listen_port", "?")
+    click.echo(f"    Connection Status : {conn_status}")
+    click.echo(f"    Listen Port       : {listen_port}")
+
+    if conn_status == "firewalled":
+        issues.append(
+            "CONNECTION STATUS = FIREWALLED!\n"
+            f"      → Port {listen_port} is NOT accessible from outside.\n"
+            "      → Peers CANNOT connect to you. You can only connect outward.\n"
+            "      → This MASSIVELY reduces upload. Fix:\n"
+            "        1. Forward port {listen_port} TCP+UDP in your router\n"
+            "        2. Or enable UPnP in qBittorrent (Options > Connection)\n"
+            "        3. Check Windows Firewall allows qBittorrent"
+        )
+    elif conn_status == "connected":
+        good.append(f"Port {listen_port} is OPEN — peers can connect to you")
+    elif conn_status == "disconnected":
+        issues.append("qBittorrent says DISCONNECTED — no internet or DHT/tracker issues")
+
+    upnp = prefs.get("upnp", False)
+    if not upnp:
+        warnings.append("UPnP is DISABLED. Enable it if you can't forward ports manually.")
+
+    # 7. Speed limits check
+    click.echo(f"\n  Speed Limits:")
+    up_limit = prefs.get("up_limit", 0)
+    dl_limit = prefs.get("dl_limit", 0)
+    alt_enabled = transfer.get("use_alt_speed_limits", 0)
+    alt_up = prefs.get("alt_up_limit", 0)
+
+    if alt_enabled:
+        click.secho(f"    Alternative Speed Mode: ACTIVE (upload cap: {alt_up // 1024} KB/s)", fg="yellow")
+        warnings.append(f"Alternative speed limits ACTIVE — upload capped to {alt_up // 1024} KB/s!")
+    else:
+        click.echo(f"    Alternative Speed Mode: OFF")
+
+    if up_limit > 0:
+        issues.append(f"Global upload limit is SET to {up_limit // 1024} KB/s! Remove it.")
+        click.secho(f"    Global Upload Limit: {up_limit // 1024} KB/s ← BOTTLENECK!", fg="red")
+    else:
+        click.echo(f"    Global Upload Limit: Unlimited")
+        good.append("No global upload speed cap")
+
+    if dl_limit > 0:
+        click.echo(f"    Global Download Limit: {dl_limit // 1024} KB/s")
+    else:
+        click.echo(f"    Global Download Limit: Unlimited")
+
+    # Per-torrent caps
+    capped_torrents = [t for t in seeding if t.get("up_limit", 0) > 0]
+    if capped_torrents:
+        warnings.append(f"{len(capped_torrents)} seeding torrent(s) have individual upload speed caps!")
+
+    # 8. Connection settings
+    click.echo(f"\n  Connection Settings:")
+    max_conn = prefs.get("max_connec", 0)
+    max_conn_torrent = prefs.get("max_connec_per_torrent", 0)
+    max_uploads = prefs.get("max_uploads", 0)
+    queue_enabled = prefs.get("queueing_enabled", True)
+    max_active_up = prefs.get("max_active_uploads", 0)
+
+    click.echo(f"    Max Connections      : {max_conn}")
+    click.echo(f"    Max Conn/Torrent     : {max_conn_torrent}")
+    click.echo(f"    Max Upload Slots     : {max_uploads}")
+    click.echo(f"    Queueing             : {'ON' if queue_enabled else 'OFF'}")
+    click.echo(f"    Max Active Uploads   : {max_active_up}")
+
+    if max_conn > 0 and max_conn < 500:
+        warnings.append(f"Max connections is only {max_conn} — increase to 2000+")
+    if queue_enabled and max_active_up > 0 and max_active_up < len(seeding):
+        issues.append(
+            f"Queue limits active: max {max_active_up} active uploads but you have {len(seeding)} seeding torrents.\n"
+            "      → Some torrents are waiting in queue doing nothing.\n"
+            "      → Disable queueing or raise max_active_uploads."
+        )
+
+    # 9. DHT / PeX / LSD
+    dht = prefs.get("dht", False)
+    pex = prefs.get("pex", False)
+    lsd = prefs.get("lsd", False)
+    click.echo(f"\n  Peer Discovery:")
+    click.echo(f"    DHT: {'ON' if dht else 'OFF'}  |  PeX: {'ON' if pex else 'OFF'}  |  LSD: {'ON' if lsd else 'OFF'}")
+    if not dht:
+        warnings.append("DHT is DISABLED — you're missing peer discovery. Enable it.")
+    if not pex:
+        warnings.append("PeX is DISABLED — you're missing peer exchange. Enable it.")
+
+    # 10. Tracker errors
+    tracker_errors = 0
+    for t in seeding[:20]:
+        try:
+            trackers = client.get_trackers(t["hash"])
+            for tr in trackers:
+                if tr.get("status") == 4:
+                    tracker_errors += 1
+        except Exception:
+            pass
+    if tracker_errors:
+        warnings.append(f"{tracker_errors} tracker error(s) detected. Run `python main.py start` for auto-healing.")
+
+    # 11. Current speed
+    up_speed = transfer.get("up_info_speed", 0)
+    dl_speed = transfer.get("dl_info_speed", 0)
+    click.echo(f"\n  Current Speed:")
+    click.echo(f"    Upload   : {format_bytes(up_speed)}/s")
+    click.echo(f"    Download : {format_bytes(dl_speed)}/s")
+
+    if up_speed == 0 and total_leechers > 0:
+        warnings.append("Leechers exist but upload is 0 — possible firewall/NAT issue.")
+
+    # ── REPORT ──────────────────────────────────────────────────
+    click.echo()
+    click.secho("  " + "═" * 50, fg="cyan")
+
+    if issues:
+        click.secho(f"\n  ❌ ISSUES FOUND ({len(issues)}):", fg="red", bold=True)
+        for i, issue in enumerate(issues, 1):
+            click.secho(f"    {i}. {issue}", fg="red")
+
+    if warnings:
+        click.secho(f"\n  ⚠️  WARNINGS ({len(warnings)}):", fg="yellow")
+        for i, w in enumerate(warnings, 1):
+            click.secho(f"    {i}. {w}", fg="yellow")
+
+    if good:
+        click.secho(f"\n  ✅ OK:", fg="green")
+        for g in good:
+            click.secho(f"    - {g}", fg="green")
+
+    # ── RECOMMENDATIONS ─────────────────────────────────────────
+    click.echo()
+    if any("FIREWALLED" in i for i in issues):
+        click.secho("  🔧 TOP PRIORITY: Forward your port. This alone can 10x your upload.", fg="red", bold=True)
+    elif total_leechers == 0:
+        click.secho("  🔧 TOP PRIORITY: Add popular/Freeleech content. No leechers = no upload.", fg="red", bold=True)
+    elif any("QUEUED" in i for i in issues):
+        click.secho("  🔧 TOP PRIORITY: Run `python main.py beast` to disable queue limits.", fg="yellow", bold=True)
+    elif up_speed == 0:
+        click.secho("  🔧 TRY: Run `python main.py beast` to force-start everything and remove limits.", fg="yellow", bold=True)
+    else:
+        click.secho("  System looks healthy. Upload should be working.", fg="green", bold=True)
+
+    click.echo()
+
+
+@cli.command()
 def beast():
     """Activate Beast Mode: max performance, all rules ON, 60s interval, full throttle."""
     config = load_config()

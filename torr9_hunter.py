@@ -1,38 +1,40 @@
 """
-IGS Torr9 Freeleech Hunter — Adapateur spécifique pour torr9.net
+IGS Torr9 Hunter — Adaptateur pour torr9.net (API REST + JWT)
 
-torr9.net est un tracker basé sur Next.js avec une API REST backend.
-L'authentification utilise un token JWT Bearer envoyé à api.torr9.net.
+Deux modes de chasse:
+  1. Freeleech Hunter — Cible les torrents marques is_freeleech=True
+  2. Popular Hunter   — Cible les torrents recents populaires (gros fichiers, beaucoup de seeders)
 
 ### Comment extraire votre token JWT :
 1. Ouvrez torr9.net dans votre navigateur et connectez-vous
-2. Ouvrez DevTools (F12) → onglet "Network"
+2. Ouvrez DevTools (F12) > onglet "Network"
 3. Rechargez la page ou cliquez sur un torrent
-4. Cherchez une requête vers "api.torr9.net"
-5. Cliquez dessus → Headers → trouvez "Authorization: Bearer <VOTRE_TOKEN>"
+4. Cherchez une requete vers "api.torr9.net"
+5. Cliquez dessus > Headers > trouvez "Authorization: Bearer <VOTRE_TOKEN>"
 6. Copiez ce TOKEN et collez-le dans config.json sous torr9.jwt_token
 """
 
 import requests
 import logging
 import threading
-import json
 
 logger = logging.getLogger("torr9_hunter")
 
 
 class Torr9Hunter:
-    """Auto-téléchargeur de torrents Freeleech pour torr9.net."""
+    """Auto-telechargeur de torrents pour torr9.net."""
 
     API_BASE = "https://api.torr9.net/api/v1"
 
-    def __init__(self, jwt_token: str, client, notifier=None, interval_sec=600, max_per_run=5, notify_only=True):
+    def __init__(self, jwt_token: str, client, notifier=None, interval_sec=600,
+                 max_per_run=5, notify_only=True, hunt_popular=True):
         self.jwt_token = jwt_token
         self.client = client
         self.notifier = notifier
         self.interval_sec = interval_sec
         self.max_per_run = max_per_run
-        self.notify_only = notify_only  # If True, only notify — never auto-download
+        self.notify_only = notify_only
+        self.hunt_popular = hunt_popular
         self._seen_ids: set[int] = set()
         self._stop = threading.Event()
         self._thread = None
@@ -47,42 +49,54 @@ class Torr9Hunter:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
         })
 
-    def fetch_freeleech(self) -> list[dict]:
-        """Récupère la liste des torrents Freeleech depuis l'API."""
+    def _fetch_torrents(self, params: dict) -> list[dict]:
+        """Fetch torrents from the API with given params."""
         try:
             resp = self._session.get(
                 f"{self.API_BASE}/torrents",
-                params={
-                    "freeleech": 1,
-                    "sort": "created_at",
-                    "order": "desc",
-                    "limit": self.max_per_run * 3,  # Over-fetch to allow deduplication
-                },
+                params=params,
                 timeout=15,
             )
             resp.raise_for_status()
             data = resp.json()
 
-            # Handle both {"data": [...]} and direct list responses
             if isinstance(data, dict):
                 torrents = data.get("data", data.get("torrents", []))
             else:
                 torrents = data
 
-            return torrents
+            return torrents if isinstance(torrents, list) else []
         except Exception as e:
-            logger.warning(f"[Torr9] Failed to fetch freeleech list: {e}")
+            logger.warning(f"[Torr9] API fetch failed: {e}")
             return []
 
+    def fetch_freeleech(self) -> list[dict]:
+        """Fetch torrents and filter to actual freeleech (is_freeleech=True)."""
+        raw = self._fetch_torrents({
+            "freeleech": 1,
+            "sort": "created_at",
+            "order": "desc",
+            "limit": 50,
+        })
+        # The API param doesn't always filter — verify server-side
+        return [t for t in raw if t.get("is_freeleech", False)]
+
+    def fetch_popular(self) -> list[dict]:
+        """Fetch recent popular torrents — good candidates for upload farming."""
+        return self._fetch_torrents({
+            "sort": "created_at",
+            "order": "desc",
+            "limit": 30,
+        })
+
     def download_torrent(self, torrent_id: int) -> bytes | None:
-        """Télécharge le fichier .torrent brut depuis l'API."""
+        """Telecharge le fichier .torrent brut depuis l'API."""
         try:
             resp = self._session.get(
                 f"{self.API_BASE}/torrents/{torrent_id}/download",
                 timeout=20,
             )
             if resp.status_code == 200 and len(resp.content) > 100:
-                # Validate it's actually a bencoded torrent (starts with 'd')
                 if resp.content.startswith(b"d"):
                     return resp.content
                 logger.warning(f"[Torr9] Download for #{torrent_id} doesn't look like a .torrent file")
@@ -92,12 +106,12 @@ class Torr9Hunter:
             logger.warning(f"[Torr9] Failed to download torrent #{torrent_id}: {e}")
         return None
 
-    def add_to_qbittorrent(self, torrent_id: int, name: str, torrent_bytes: bytes) -> bool:
-        """Ajoute le torrent dans qBittorrent via l'API et marque comme Freeleech."""
+    def add_to_qbittorrent(self, torrent_id: int, name: str, torrent_bytes: bytes, category: str) -> bool:
+        """Ajoute le torrent dans qBittorrent."""
         try:
             resp = self.client.session.post(
                 f"{self.client.base_url}/torrents/add",
-                data={"category": "Freeleech-Torr9", "tags": "freeleech,torr9"},
+                data={"category": category, "tags": "torr9,auto-hunted"},
                 files={"torrents": (f"torr9_{torrent_id}.torrent", torrent_bytes, "application/x-bittorrent")},
             )
             if resp.ok or resp.text == "Ok.":
@@ -106,60 +120,102 @@ class Torr9Hunter:
             logger.warning(f"[Torr9] qBittorrent add failed for #{torrent_id}: {e}")
         return False
 
-    def _format_size(self, size_bytes: int) -> str:
+    def add_by_magnet(self, magnet: str, category: str) -> bool:
+        """Add torrent by magnet link (fallback if .torrent download fails)."""
+        try:
+            return self.client.add_torrent(urls=magnet, category=category)
+        except Exception as e:
+            logger.warning(f"[Torr9] Magnet add failed: {e}")
+            return False
+
+    def _format_size(self, size_bytes) -> str:
+        try:
+            size_bytes = int(size_bytes)
+        except (TypeError, ValueError):
+            return "? B"
         for unit in ["B", "KB", "MB", "GB", "TB"]:
             if size_bytes < 1024:
                 return f"{size_bytes:.1f} {unit}"
             size_bytes /= 1024
         return f"{size_bytes:.1f} PB"
 
-    def run_once(self) -> int:
-        """Exécute un cycle de chasse Freeleech. Retourne le nombre de torrents ajoutés."""
-        freeleech = self.fetch_freeleech()
-        if not freeleech:
-            logger.info("[Torr9] No freeleech torrents found or API error.")
-            return 0
+    def _process_torrent(self, t: dict, category: str) -> bool:
+        """Process a single torrent: download and add to qBittorrent. Returns True if added."""
+        torrent_id = t.get("id") or t.get("torrent_id")
+        name = t.get("title") or t.get("name") or f"Torrent-{torrent_id}"
+        size = t.get("file_size_bytes") or t.get("size") or t.get("file_size") or 0
+        magnet = t.get("magnet_link", "")
 
-        added = 0
-        for t in freeleech:
-            if added >= self.max_per_run:
-                break
+        if not torrent_id or torrent_id in self._seen_ids:
+            return False
 
-            # Handle different possible field names from the API
-            torrent_id = t.get("id") or t.get("torrent_id")
-            name = t.get("name") or t.get("title") or f"Torrent-{torrent_id}"
-            size = t.get("size") or t.get("file_size") or 0
+        size_str = self._format_size(size)
 
-            if not torrent_id or torrent_id in self._seen_ids:
-                continue
+        if self.notify_only:
+            self._seen_ids.add(torrent_id)
+            is_fl = t.get("is_freeleech", False)
+            tag = "FL " if is_fl else ""
+            print(f"[Torr9] {tag}{name[:60]} ({size_str})")
+            if self.notifier:
+                self.notifier.send(
+                    f"{'🆓 <b>Freeleech' if is_fl else '📦 <b>Torrent'} Torr9</b>\n\n"
+                    f"📦 <code>{name[:60]}</code>\n"
+                    f"💾 {size_str}\n"
+                    f"🔗 <a href='https://torr9.net/torrents/{torrent_id}'>Voir</a>"
+                )
+            return True
 
-            logger.info(f"[Torr9] Found freeleech: {name[:60]} (#{torrent_id})")
-            size_str = self._format_size(size)
-
-            if self.notify_only:
-                # Only alert — do NOT download automatically
+        # Try .torrent download first, fallback to magnet
+        torrent_bytes = self.download_torrent(torrent_id)
+        if torrent_bytes:
+            if self.add_to_qbittorrent(torrent_id, name, torrent_bytes, category):
                 self._seen_ids.add(torrent_id)
-                added += 1
-                print(f"[Torr9] 🔔 Freeleech Alert: {name[:60]} ({size_str}) → https://torr9.net/torrents/{torrent_id}")
+                print(f"[Torr9] Added: {name[:60]} ({size_str})")
                 if self.notifier:
-                    self.notifier.send(
-                        f"🆓 <b>Freeleech Torr9</b>\n\n"
-                        f"📦 <code>{name[:60]}</code>\n"
-                        f"💾 {size_str}\n"
-                        f"🔗 <a href='https://torr9.net/torrents/{torrent_id}'>Voir le torrent</a>"
-                    )
-            else:
-                torrent_bytes = self.download_torrent(torrent_id)
-                if not torrent_bytes:
-                    continue
-                if self.add_to_qbittorrent(torrent_id, name, torrent_bytes):
-                    self._seen_ids.add(torrent_id)
+                    self.notifier.alert_freeleech_added(name, size_str)
+                return True
+        elif magnet:
+            if self.add_by_magnet(magnet, category):
+                self._seen_ids.add(torrent_id)
+                print(f"[Torr9] Added (magnet): {name[:60]} ({size_str})")
+                if self.notifier:
+                    self.notifier.alert_freeleech_added(name, size_str)
+                return True
+
+        logger.warning(f"[Torr9] Failed to add {name[:40]}")
+        return False
+
+    def run_once(self) -> int:
+        """Execute un cycle de chasse. Retourne le nombre de torrents ajoutes."""
+        added = 0
+
+        # Phase 1: Freeleech (top priority — free ratio)
+        freeleech = self.fetch_freeleech()
+        if freeleech:
+            print(f"[Torr9] Found {len(freeleech)} freeleech torrent(s)")
+            for t in freeleech:
+                if added >= self.max_per_run:
+                    break
+                if self._process_torrent(t, "Freeleech-Torr9"):
                     added += 1
-                    print(f"[Torr9] ✅ Added: {name[:60]} ({size_str})")
-                    if self.notifier:
-                        self.notifier.alert_freeleech_added(name, size_str)
-                else:
-                    logger.warning(f"[Torr9] Failed to add {name}")
+
+        # Phase 2: Popular recent torrents (more leechers = more upload)
+        if self.hunt_popular and added < self.max_per_run:
+            popular = self.fetch_popular()
+            if popular:
+                # Sort by size descending — bigger files = more data to upload
+                popular.sort(key=lambda x: x.get("file_size_bytes", 0) or 0, reverse=True)
+                for t in popular:
+                    if added >= self.max_per_run:
+                        break
+                    tid = t.get("id")
+                    if tid in self._seen_ids:
+                        continue
+                    if self._process_torrent(t, "Popular-Torr9"):
+                        added += 1
+
+        if added == 0 and not freeleech:
+            print("[Torr9] No new torrents to add this cycle.")
 
         return added
 
@@ -167,7 +223,7 @@ class Torr9Hunter:
         while not self._stop.is_set():
             try:
                 added = self.run_once()
-                print(f"[Torr9] Cycle done — {added} torrent(s) added.")
+                print(f"[Torr9] Cycle done — {added} torrent(s) processed.")
             except Exception as e:
                 logger.error(f"[Torr9] Unexpected error: {e}")
             self._stop.wait(self.interval_sec)
@@ -176,7 +232,9 @@ class Torr9Hunter:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="Torr9Hunter")
         self._thread.start()
-        print(f"[Torr9] 🟢 Freeleech Hunter started (every {self.interval_sec}s, max {self.max_per_run}/run)")
+        mode = "Alert Only" if self.notify_only else "Auto-Download"
+        popular = " + Popular" if self.hunt_popular else ""
+        print(f"[Torr9] Freeleech{popular} Hunter started ({mode}, every {self.interval_sec}s, max {self.max_per_run}/run)")
 
     def stop(self):
         self._stop.set()
@@ -186,20 +244,20 @@ class Torr9Hunter:
 
 
 def build_torr9_hunter(config: dict, client, notifier=None):
-    """Construit un Torr9Hunter depuis config.json. Renvoie None si non configuré."""
+    """Construit un Torr9Hunter depuis config.json. Renvoie None si non configure."""
     torr9_cfg = config.get("torr9", {})
     if not torr9_cfg.get("enabled", False):
         return None
     jwt = torr9_cfg.get("jwt_token", "")
     if not jwt:
-        logger.warning("[Torr9] No jwt_token configured — skipping Torr9 hunter.")
+        logger.warning("[Torr9] No jwt_token configured — skipping.")
         return None
-    notify_only = torr9_cfg.get("notify_only", True)  # Default: alert only, no auto-download
     return Torr9Hunter(
         jwt_token=jwt,
         client=client,
         notifier=notifier,
         interval_sec=torr9_cfg.get("interval_sec", 600),
         max_per_run=torr9_cfg.get("max_per_run", 5),
-        notify_only=notify_only,
+        notify_only=torr9_cfg.get("notify_only", True),
+        hunt_popular=torr9_cfg.get("hunt_popular", True),
     )
