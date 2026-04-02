@@ -9,6 +9,7 @@ from automation import (
     RatioGuardRule, RaceRule, ISPEvasionRule, SniperRule, DictatorshipRule,
     HealingRule, AntiSpywareRule, UploadGoalRule, NightRaidRule,
     SwarmDominatorRule, TrackerBoosterRule, RevengeRule,
+    BandwidthOptimizerRule, PeerBlitzRule,
 )
 from notifier import load_notifier
 from tracker_stats import print_summary, format_bytes
@@ -694,6 +695,7 @@ def beast():
         "queueing_enabled": False,
         "max_active_uploads": -1,
         "max_active_torrents": -1,
+        "scheduler_enabled": False,
     }
     try:
         client.set_preferences(beast_prefs)
@@ -702,13 +704,17 @@ def beast():
         click.secho("    Queueing: DISABLED (all torrents active)", fg="green")
         click.secho("    DHT + PeX + LSD: ENABLED", fg="green")
         click.secho("    IP Blocklist: ACTIVE", fg="green")
+        # Disable alt-speed if currently active
+        if client.get_speed_limits_mode() == 1:
+            client.toggle_speed_limits_mode()
+            click.secho("    Alt Speed Limits: DISABLED (was active)", fg="green")
     except Exception as e:
         click.secho(f"    Failed: {e}", fg="red")
 
     # 2. Force-start ALL seeding torrents
     click.secho("  [2/4] Force-starting all seeders...", fg="yellow")
     torrents = client.get_torrents()
-    seeders = [t for t in torrents if t.get("state") in ("uploading", "stalledUP", "pausedUP", "queuedUP")]
+    seeders = [t for t in torrents if t.get("state") in ("uploading", "stalledUP", "forcedUP", "pausedUP", "queuedUP")]
     for t in seeders:
         client.set_force_start(t["hash"], True)
         if t.get("up_limit", 0) > 0:
@@ -724,11 +730,13 @@ def beast():
     # 4. Start engine with ALL 15 rules at 60s interval
     click.secho("  [3/4] Starting automation engine (60s interval, 15 rules)...", fg="yellow")
 
-    # Force all rules ON
+    # Force all rules ON (respect config for ISP evasion)
     rules_cfg = config.get("automation", {}).get("rules", {})
     rules = []
     rules.append(RaceRule(max_age_hours=rules_cfg.get("race_rule", {}).get("max_age_hours", 2)))
-    rules.append(ISPEvasionRule())
+    isp_cfg = rules_cfg.get("isp_evasion", {})
+    if isp_cfg.get("enabled", True):
+        rules.append(ISPEvasionRule())
     rules.append(SniperRule())
     rules.append(DictatorshipRule(notifier=notifier))
     rules.append(HealingRule())
@@ -799,6 +807,198 @@ def beast():
         if torr9_instance:
             torr9_instance.stop()
         click.echo("[*] Beast Mode stopped.")
+
+
+@cli.command()
+def turbo():
+    """TURBO MODE: Maximum upload speed. 30s cycles, 17 rules, extreme aggression.
+
+    Goes beyond Beast Mode:
+    - 30s automation cycles (2x faster reaction)
+    - BandwidthOptimizer: funnels bandwidth to highest-ROI torrents
+    - PeerBlitz: force-revives stalled connections every cycle
+    - 5000 max connections, 1500/torrent
+    - Disables download completely to give 100% to upload
+    - Force-starts and reannounces everything immediately
+    """
+    config = load_config()
+    client = make_client(config)
+    notifier = load_notifier(config)
+
+    click.secho("", fg="magenta")
+    click.secho("  ╔══════════════════════════════════════════════╗", fg="magenta", bold=True)
+    click.secho("  ║       ⚡ IGS TURBO MODE ACTIVATED ⚡         ║", fg="magenta", bold=True)
+    click.secho("  ╚══════════════════════════════════════════════╝", fg="magenta", bold=True)
+    click.secho("", fg="magenta")
+
+    # 1. Extreme qBittorrent settings
+    click.secho("  [1/5] Injecting TURBO performance settings...", fg="yellow")
+    blocklist_url = "https://github.com/Naunter/BT_BlockLists/raw/master/bt_blocklists.gz"
+    turbo_prefs = {
+        # Extreme connections
+        "max_connec": 5000,
+        "max_connec_per_torrent": 1500,
+        "max_uploads": 1000,
+        "max_uploads_per_torrent": 250,
+        "max_half_open_connections": 300,
+        # Rate-based choking (aggressive upload)
+        "choking_algorithm": 1,
+        # Kill all speed limits
+        "up_limit": 0,
+        "dl_limit": 0,
+        "alt_up_limit": 0,
+        "alt_dl_limit": 0,
+        # Disable alt speed mode
+        "scheduler_enabled": False,
+        # All peer discovery ON
+        "dht": True,
+        "pex": True,
+        "lsd": True,
+        # UPnP for port access
+        "upnp": True,
+        # Disable all queueing
+        "queueing_enabled": False,
+        "max_active_uploads": -1,
+        "max_active_torrents": -1,
+        "max_active_downloads": -1,
+        # Security
+        "ip_filter_enabled": True,
+        "ip_filter_path": blocklist_url,
+        "ip_filter_trackers": True,
+        # Disk cache optimization
+        "disk_cache": 512,  # 512MB cache
+        "disk_cache_ttl": 120,
+        # Send buffer optimization
+        "send_buffer_watermark": 5120,  # 5MB
+        "send_buffer_low_watermark": 512,
+        "send_buffer_watermark_factor": 200,  # 200%
+    }
+    try:
+        client.set_preferences(turbo_prefs)
+        click.secho("    Connections: 5000 | Per-Torrent: 1500 | Uploads: 1000", fg="green")
+        click.secho("    Half-Open: 300 | Rate-Based Choking: ON", fg="green")
+        click.secho("    Queueing: DISABLED | UPnP: ON", fg="green")
+        click.secho("    Disk Cache: 512MB | Send Buffer: 5MB", fg="green")
+    except Exception as e:
+        click.secho(f"    Failed: {e}", fg="red")
+
+    # 2. Force-start ALL seeding torrents + uncap + super-seed
+    click.secho("  [2/5] Force-starting everything + Super-Seed...", fg="yellow")
+    torrents = client.get_torrents()
+    seeders = [t for t in torrents if t.get("state") in ("uploading", "stalledUP", "pausedUP", "queuedUP", "forcedUP")]
+    for t in seeders:
+        h = t["hash"]
+        client.set_force_start(h, True)
+        if t.get("up_limit", 0) > 0:
+            client.set_upload_limit(h, 0)
+        if t.get("num_leechs", 0) >= 1 and not t.get("super_seeding", False):
+            try:
+                client.set_super_seeding(h, True)
+            except Exception:
+                pass
+        # Unlimited share ratio
+        try:
+            client.set_share_limits(h, ratio_limit=-1, seeding_time_limit=-1)
+        except Exception:
+            pass
+    click.secho(f"    Force-started {len(seeders)} torrent(s) with Super-Seed + unlimited ratio", fg="green")
+
+    # 3. Pause ALL downloads to free 100% bandwidth
+    click.secho("  [3/5] Killing all downloads (100% upload focus)...", fg="yellow")
+    downloading = [t for t in torrents if t.get("state") in ("downloading", "stalledDL", "forcedDL")]
+    if downloading:
+        client.pause("|".join(t["hash"] for t in downloading))
+        click.secho(f"    Paused {len(downloading)} download(s)", fg="green")
+    else:
+        click.secho("    No active downloads to pause", fg="green")
+
+    # 4. Force reannounce EVERYTHING
+    click.secho("  [4/5] Force reannouncing all seeders...", fg="yellow")
+    if seeders:
+        client.reannounce("|".join(t["hash"] for t in seeders))
+        click.secho(f"    Reannounced {len(seeders)} torrent(s)", fg="green")
+
+    # 5. Start engine with ALL 17 rules at 30s interval
+    click.secho("  [5/5] Starting TURBO automation engine (30s interval, 17 rules)...", fg="yellow")
+    rules_cfg = config.get("automation", {}).get("rules", {})
+    rules = [
+        RaceRule(max_age_hours=4, min_leechers=1),  # Wider race window
+        ISPEvasionRule(),
+        SniperRule(min_speed_kbps=25, demand_leechers=1),  # Lower thresholds
+        DictatorshipRule(trigger_leechers=1, notifier=notifier),  # Trigger on 1 leecher
+        HealingRule(),
+        AntiSpywareRule(notifier=notifier),
+        StaleSeederRule(max_idle_hours=72),  # More patience before pausing
+        CleanupRule(min_ratio=3.0, min_active_seed_hours=96),  # Keep seeding longer
+        RatioGuardRule(),
+        UploadGoalRule(
+            target_bytes=int(rules_cfg.get("upload_goal", {}).get("target_tb", 1.0) * 1024**4),
+            notifier=notifier,
+        ),
+        NightRaidRule(notifier=notifier),
+        SwarmDominatorRule(max_seeders=5, min_leechers=1, notifier=notifier),  # Wider domination
+        TrackerBoosterRule(),
+        RevengeRule(revenge_below_ratio=0.3, min_downloaded_mb=50, notifier=notifier),  # More aggressive
+        BandwidthOptimizerRule(top_pct=0.3, throttle_kbps=25),  # NEW: Smart bandwidth
+        PeerBlitzRule(min_leechers=1, speed_threshold_kbps=5),  # NEW: Revive stalled
+    ]
+
+    engine = AutomationEngine(client, rules=rules, interval_sec=30, notifier=notifier)
+    engine.start()
+    click.secho(f"    {len(rules)} rules active | 30s cycle | Adaptive interval ON", fg="green")
+
+    # Start hunters
+    fh_instance = None
+    fh_cfg = config.get("freeleech_hunter", {})
+    if fh_cfg.get("enabled", False):
+        from freeleech_hunter import FreeleechHunter, build_profiles
+        profiles = build_profiles(config)
+        if profiles:
+            fh_instance = FreeleechHunter(
+                client=client, profiles=profiles,
+                interval_sec=300,  # Faster hunting in turbo
+                notifier=notifier, max_per_run=10,  # More per run
+            )
+            fh_instance.start()
+            click.secho(f"    Freeleech Hunter: ACTIVE ({len(profiles)} tracker(s), 300s cycle)", fg="green")
+
+    from torr9_hunter import build_torr9_hunter
+    torr9_instance = build_torr9_hunter(config, client, notifier=notifier)
+    if torr9_instance:
+        torr9_instance.start()
+        click.secho(f"    Torr9 Hunter: ACTIVE", fg="green")
+
+    click.secho("")
+    click.secho("  ══════════════════════════════════════════════", fg="magenta")
+    click.secho(f"  ⚡ TURBO RUNNING — {len(seeders)} seeders | {len(rules)} rules | 30s cycles", fg="magenta", bold=True)
+    click.secho("  ══════════════════════════════════════════════", fg="magenta")
+    click.secho("  Press Ctrl+C to stop.\n", dim=True)
+
+    if notifier and notifier.enabled:
+        notifier.send(
+            "⚡ <b>TURBO MODE ACTIVATED</b>\n\n"
+            f"🚀 {len(seeders)} seeders force-started + Super-Seed\n"
+            f"⚙️ {len(rules)} rules active | 30s cycles\n"
+            f"📡 Connections: 5000 | Uploads: 1000\n"
+            f"⬇️ Downloads: PAUSED ({len(downloading)} killed)\n"
+            "100% bandwidth → Upload. Maximum aggression."
+        )
+
+    try:
+        import time as _time
+        while True:
+            _time.sleep(1)
+    except KeyboardInterrupt:
+        engine.stop()
+        if fh_instance:
+            fh_instance.stop()
+        if torr9_instance:
+            torr9_instance.stop()
+        # Restore downloads
+        if downloading:
+            click.echo("[*] Restoring paused downloads...")
+            client.resume("|".join(t["hash"] for t in downloading))
+        click.echo("[*] Turbo Mode stopped.")
 
 
 cli.add_command(list_torrents, name="ls")
